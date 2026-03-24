@@ -78,8 +78,9 @@ STALE_POSITION_DAYS = 30
 MAX_THEME_FRACTION = 0.40  # max 40% portfolio in correlated positions (was 25%, raised until ODDS_API_KEY available)
 
 # Exit thresholds
-STOP_LOSS_PCT = 0.30   # sell if position lost 30% value
-TAKE_PROFIT_PCT = 0.15  # sell if position gained 15% value
+# NO take profit — let winners run to expiry. $80 -> $1000 requires compounding big wins.
+# Stop loss only for deadweight positions that lock up capital with no recovery prospect.
+STOP_LOSS_PCT = 0.60   # sell if position lost 60%+ value (likely not recovering)
 
 # Divergence thresholds per signal source
 DIVERGENCE_THRESHOLDS = {
@@ -863,16 +864,36 @@ def execute_trade(market: dict, signal: dict, bankroll: float) -> dict | None:
     else:
         price = round(price, 2)
 
+    # Check existing position size BEFORE sizing new order
+    # This prevents accidental over-allocation from repeated fills
+    positions = load_json(POSITIONS_FILE)
+    existing_cost = sum(
+        p.get("cost", 0) for p in positions
+        if p.get("status") == "open" and p.get("token_id") == token_id
+    )
+    max_per_position = bankroll * MAX_POSITION_FRACTION
+    remaining_budget = max(0, max_per_position - existing_cost)
+
+    if existing_cost > 0:
+        if remaining_budget < 1.0:
+            log.info(f"SKIP (max position): '{question[:40]}' already ${existing_cost:.2f} invested (max ${max_per_position:.2f})")
+            return None
+        log.info(f"Existing position ${existing_cost:.2f} in '{question[:30]}', budget remaining: ${remaining_budget:.2f}")
+
     dollar_size = position_size(bankroll, est_prob, price)
     if dollar_size < 1.0:
         return None
+
+    # Cap by remaining budget for this position
+    if existing_cost > 0:
+        dollar_size = min(dollar_size, remaining_budget)
 
     shares = max(5, int(dollar_size / price))  # Min 5 shares (Polymarket minimum)
     cost = round(shares * price, 2)
 
     # Safety caps
-    if cost > bankroll * MAX_POSITION_FRACTION:
-        shares = max(5, int((bankroll * MAX_POSITION_FRACTION) / price))
+    if cost > max_per_position - existing_cost:
+        shares = max(5, int((max_per_position - existing_cost) / price))
         cost = round(shares * price, 2)
 
     if cost > bankroll * (1.0 - CASH_RESERVE_FRACTION):
@@ -1012,10 +1033,10 @@ def check_correlation_limit(theme: str, new_cost: float, bankroll: float) -> boo
 
 def check_position_exits():
     """
-    Check open positions for exit conditions:
-    - Stop loss: position lost >30% of value → sell
-    - Take profit: position gained >15% → sell
-    Uses current_value from Data API reconciliation when available.
+    Check open positions for exit conditions.
+    NO take profit — let winners run. $80→$1000 requires compounding big wins.
+    Stop loss only for deadweight (>60% loss) to free capital for better opportunities.
+    Uses current_value from Data API reconciliation.
     """
     positions = load_json(POSITIONS_FILE)
     exits_done = 0
@@ -1024,43 +1045,36 @@ def check_position_exits():
         if pos.get("status") != "open":
             continue
 
-        slug = pos.get("slug", "")
-        if not slug:
+        cost = pos.get("cost", 0)
+        current_value = pos.get("current_value")
+
+        # Need current_value from reconciliation
+        if current_value is None or cost <= 0:
             continue
 
-        try:
-            market = fetch_market_by_slug(slug)
-            if not market:
+        pnl_pct = (current_value - cost) / cost
+
+        # Only exit: deadweight positions losing >60% with no recovery prospect
+        if pnl_pct < -STOP_LOSS_PCT:
+            slug = pos.get("slug", "")
+            if not slug:
                 continue
 
-            pt = parse_prices_and_tokens(market)
-            if not pt:
-                continue
+            try:
+                market = fetch_market_by_slug(slug)
+                if not market:
+                    continue
 
-            # Get current price of our position
-            side = pos.get("side", "").upper()
-            if side == "YES":
-                current_price = pt["yes_price"]
-            else:
-                current_price = pt["no_price"]
+                pt = parse_prices_and_tokens(market)
+                if not pt:
+                    continue
 
-            avg_price = pos.get("avg_price", 0)
-            if avg_price <= 0:
-                continue
+                side = pos.get("side", "").upper()
+                if side == "YES":
+                    current_price = pt["yes_price"]
+                else:
+                    current_price = pt["no_price"]
 
-            shares = pos.get("shares", 0)
-            cost = pos.get("cost", 0)
-
-            # Use Data API current_value if available, otherwise calculate
-            current_value = pos.get("current_value")
-            if current_value is None or current_value == 0:
-                current_value = shares * current_price
-
-            # Calculate P&L percentage
-            pnl_pct = (current_value - cost) / cost if cost > 0 else 0
-
-            # Stop loss
-            if pnl_pct < -STOP_LOSS_PCT:
                 log.info(
                     f"STOP LOSS: '{pos['market'][:40]}' "
                     f"P&L: {pnl_pct*100:.1f}% (threshold: -{STOP_LOSS_PCT*100:.0f}%)"
@@ -1069,22 +1083,12 @@ def check_position_exits():
                 if success:
                     exits_done += 1
 
-            # Take profit
-            elif pnl_pct > TAKE_PROFIT_PCT:
-                log.info(
-                    f"TAKE PROFIT: '{pos['market'][:40]}' "
-                    f"P&L: +{pnl_pct*100:.1f}% (threshold: +{TAKE_PROFIT_PCT*100:.0f}%)"
-                )
-                success = sell_position(pos, market, pt, current_price)
-                if success:
-                    exits_done += 1
-
-            time.sleep(0.5)
-        except Exception as e:
-            log.debug(f"Error checking exit for '{pos.get('market', '')[:30]}': {e}")
+                time.sleep(0.5)
+            except Exception as e:
+                log.debug(f"Error checking exit for '{pos.get('market', '')[:30]}': {e}")
 
     if exits_done > 0:
-        log.info(f"Exited {exits_done} positions (stop loss / take profit)")
+        log.info(f"Exited {exits_done} deadweight positions")
 
     return exits_done
 
