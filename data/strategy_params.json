@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "updated_at": "2026-03-24T08:30:00+00:00",
+  "source_stats": {},
+  "blocked_sources": [],
+  "position_sizing": {
+    "max_fraction": 0.15,
+    "kelly_multiplier": 0.5
+  },
+  "total_resolved_trades": 0,
+  "overall_roi": 0.0
+}
