@@ -85,12 +85,12 @@ TAKE_PROFIT_PCT = 0.15  # sell if position gained 15% value
 DIVERGENCE_THRESHOLDS = {
     "sportsbook_high": 0.02,   # 4+ bookmakers
     "sportsbook_low": 0.04,    # 1-2 bookmakers
-    "manifold": 0.08,
+    "manifold": 0.06,          # Was 0.08 — verlaagd voor meer diversiteit
     "metaculus": 0.05,
-    "crypto_model": 0.06,
+    "crypto_model": 0.05,
     "deribit": 0.05,
-    "oil_futures": 0.06,
-    "fedwatch": 0.06,
+    "oil_futures": 0.05,
+    "fedwatch": 0.05,
 }
 
 # Theme keywords for correlation tracking
@@ -745,8 +745,16 @@ def evaluate_with_signal(market: dict, pt: dict) -> dict | None:
         price = pt["no_price"]
         est_prob = 1.0 - ext_prob
 
-    # Sanity: est_prob must be > price for positive Kelly
+    # Sanity checks
     if est_prob <= price:
+        return None
+
+    # Skip extreme penny markets (price <$0.05 = <5% probability)
+    if price < 0.05:
+        return None
+
+    # Skip very high price markets (>$0.96 = tiny upside)
+    if price > 0.96:
         return None
 
     edge = est_prob - price
