@@ -75,7 +75,7 @@ MIN_VOLUME_24H = 1000
 STALE_POSITION_DAYS = 30
 
 # Correlation limits
-MAX_THEME_FRACTION = 0.25  # max 25% portfolio in correlated positions
+MAX_THEME_FRACTION = 0.40  # max 40% portfolio in correlated positions (was 25%, raised until ODDS_API_KEY available)
 
 # Exit thresholds
 STOP_LOSS_PCT = 0.30   # sell if position lost 30% value
@@ -438,105 +438,162 @@ def position_size(bankroll: float, prob_win: float, price: float) -> float:
 
 def reconcile_positions():
     """
-    Reconcile positions.json against actual order fill status.
-    Rebuild positions from trades that were actually matched (have transactionsHashes).
-    Remove phantom positions from unfilled orders.
-    """
-    positions = load_json(POSITIONS_FILE)
-    trades = load_json(TRADES_FILE)
+    Reconcile positions.json against on-chain reality via the Data API.
 
-    if not trades:
+    The Data API is the ONLY source of truth for:
+    - Which positions exist (shares, avg_price, cost, current_value, pnl)
+
+    Local positions.json is the source of truth for:
+    - Market names, slugs, side labels, signal_source, theme, category
+
+    This runs every cycle to:
+    1. Update shares/cost/value for known positions
+    2. Detect NEW positions (fills the bot didn't know about)
+    3. Detect CLOSED positions (resolved/redeemed on-chain)
+    """
+    if not FUNDER_ADDRESS:
+        log.error("FUNDER_ADDRESS not set, cannot reconcile.")
         return
 
-    # Cancel all open orders via CLOB (clean slate)
+    # Fetch actual positions from Data API
     try:
-        client = get_client()
-        open_orders = client.get_orders() or []
-        for order in open_orders:
-            order_id = order.get("id", "") or order.get("orderID", "")
-            if order_id:
-                try:
-                    client.cancel(order_id)
-                    log.info(f"Cancelled open order {order_id[:16]}...")
-                except Exception:
-                    pass
+        resp = requests.get(
+            f"{DATA_API}/positions",
+            params={"user": FUNDER_ADDRESS.lower()},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        on_chain = resp.json()
     except Exception as e:
-        log.error(f"Failed to fetch/cancel open orders: {e}")
+        log.error(f"Data API positions fetch failed: {e}")
+        return
 
-    # Rebuild positions from MATCHED trades only
-    matched_positions = {}  # token_id -> position
+    if not isinstance(on_chain, list):
+        log.error(f"Unexpected Data API response: {type(on_chain)}")
+        return
 
-    for t in trades:
-        resp = t.get("response", {})
-        status = resp.get("status", "")
+    # Build lookup of on-chain positions by asset_id (token_id)
+    chain_by_token = {}
+    for oc in on_chain:
+        asset_id = oc.get("asset", "")
+        size = float(oc.get("size", 0))
+        if size < 0.1:
+            continue  # Skip dust
+        chain_by_token[asset_id] = oc
 
-        if status != "matched" or not resp.get("transactionsHashes"):
-            market = t.get("market", "?")[:40
-            ]
-            log.warning(f"PHANTOM TRADE: '{market}' status={status} — not a real fill")
-            continue
+    # Load current local positions
+    old_positions = load_json(POSITIONS_FILE)
+    old_open = {p.get("token_id"): p for p in old_positions if p.get("status") == "open"}
+    resolved_positions = [p for p in old_positions if p.get("status") in ("resolved", "sold")]
 
-        token_id = t.get("token_id", "")
-        if not token_id:
-            continue
+    new_positions = []
+    updated = 0
+    discovered = 0
 
-        if token_id in matched_positions:
-            # Average into existing position
-            pos = matched_positions[token_id]
-            old_shares = pos["shares"]
-            old_cost = pos["cost"]
-            new_shares = old_shares + t.get("shares", t.get("size", 0))
-            new_cost = old_cost + t.get("cost", 0)
-            pos["shares"] = new_shares
-            pos["cost"] = round(new_cost, 2)
-            pos["avg_price"] = round(new_cost / new_shares, 4) if new_shares > 0 else 0
-            pos["max_payout"] = new_shares
+    for token_id, oc in chain_by_token.items():
+        size = float(oc.get("size", 0))
+        avg_price = float(oc.get("avgPrice", 0))
+        initial_value = float(oc.get("initialValue", 0))
+        current_value = float(oc.get("currentValue", 0))
+        cash_pnl = float(oc.get("cashPnl", 0))
+        condition_id = oc.get("conditionId", "")
+
+        if token_id in old_open:
+            # KNOWN position — update numbers from chain, keep our metadata
+            pos = dict(old_open[token_id])  # copy
+            pos["shares"] = round(size, 2)
+            pos["avg_price"] = round(avg_price, 4)
+            pos["cost"] = round(initial_value, 2)
+            pos["max_payout"] = round(size, 2)
+            pos["current_value"] = round(current_value, 2)
+            pos["unrealized_pnl"] = round(cash_pnl, 2)
+            pos["last_updated"] = datetime.now(timezone.utc).isoformat()
+            new_positions.append(pos)
+            updated += 1
         else:
-            # Determine theme from market question
-            market_text = t.get("market", "")
-            theme = detect_theme(market_text)
-            shares = t.get("shares", t.get("size", 0))
-
-            matched_positions[token_id] = {
-                "market": market_text,
-                "slug": t.get("slug", ""),
-                "condition_id": t.get("condition_id", ""),
+            # NEW position — the bot didn't know about this fill
+            # This happens when an order was filled but the bot thought it wasn't
+            discovered += 1
+            question = oc.get("title", f"Unknown (token: {token_id[:16]}...)")
+            theme = detect_theme(question)
+            log.warning(
+                f"DISCOVERED NEW POSITION: '{question[:50]}' "
+                f"shares={size:.1f}, cost=${initial_value:.2f}, value=${current_value:.2f}"
+            )
+            new_positions.append({
+                "market": question,
+                "slug": "",
+                "condition_id": condition_id,
                 "token_id": token_id,
-                "side": t.get("side", "BUY"),
-                "shares": shares,
-                "avg_price": t.get("price", 0),
-                "cost": round(t.get("cost", 0), 2),
-                "max_payout": shares,
-                "entry_date": t.get("timestamp", "")[:10],
-                "end_date": t.get("end_date", ""),
+                "side": "UNKNOWN",
+                "shares": round(size, 2),
+                "avg_price": round(avg_price, 4),
+                "cost": round(initial_value, 2),
+                "max_payout": round(size, 2),
+                "current_value": round(current_value, 2),
+                "unrealized_pnl": round(cash_pnl, 2),
+                "end_date": "",
                 "status": "open",
-                "category": t.get("category", "unknown"),
-                "neg_risk": t.get("neg_risk", False),
-                "order_id": resp.get("orderID", ""),
-                "signal_source": t.get("signal_source", "heuristic"),
+                "category": "unknown",
+                "neg_risk": False,
+                "signal_source": "unknown",
                 "theme": theme,
                 "last_updated": datetime.now(timezone.utc).isoformat(),
-            }
+            })
 
-    # Preserve resolved/sold positions from old list
-    resolved_positions = [p for p in positions if p.get("status") in ("resolved", "sold")]
+    # Check for positions that disappeared from chain (resolved/redeemed)
+    closed = 0
+    for token_id, pos in old_open.items():
+        if token_id not in chain_by_token:
+            # Position no longer on chain — it was resolved or redeemed
+            pos["status"] = "resolved"
+            pos["resolved_at"] = datetime.now(timezone.utc).isoformat()
+            # If current_value was tracked, use that for pnl
+            cost = pos.get("cost", 0)
+            last_value = pos.get("current_value", 0)
+            if last_value > cost:
+                pos["profit"] = round(last_value - cost, 2)
+                pos["won"] = True
+                log.info(f"RESOLVED (on-chain): '{pos.get('market', '?')[:40]}' -> +${pos['profit']:.2f}")
+            else:
+                pos["profit"] = round(last_value - cost, 2)
+                pos["won"] = False
+                log.info(f"RESOLVED (on-chain): '{pos.get('market', '?')[:40]}' -> ${pos['profit']:.2f}")
+            resolved_positions.append(pos)
+            closed += 1
 
-    # Combine
-    new_positions = resolved_positions + list(matched_positions.values())
+            # Record in PnL
+            pnl = load_json(PNL_FILE)
+            pnl.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "market": pos.get("market", ""),
+                "side": pos.get("side", ""),
+                "cost": cost,
+                "shares": pos.get("shares", 0),
+                "won": pos.get("won", False),
+                "payout": last_value,
+                "profit": pos.get("profit", 0),
+                "exit_type": "resolved_onchain",
+                "signal_source": pos.get("signal_source", "unknown"),
+            })
+            save_json(PNL_FILE, pnl)
 
-    # Calculate stats
-    old_open = [p for p in positions if p.get("status") == "open"]
-    old_cost = sum(p.get("cost", 0) for p in old_open)
-    new_cost = sum(p.get("cost", 0) for p in matched_positions.values())
-    phantoms = len(old_open) - len(matched_positions)
+            # Quick learn
+            quick_learn(pos)
 
-    save_json(POSITIONS_FILE, new_positions)
+    all_positions = resolved_positions + new_positions
+
+    total_cost = sum(p["cost"] for p in new_positions)
+    total_value = sum(p["current_value"] for p in new_positions)
+    total_pnl = sum(p["unrealized_pnl"] for p in new_positions)
+
+    save_json(POSITIONS_FILE, all_positions)
 
     log.info(
-        f"RECONCILIATION COMPLETE: "
-        f"{len(matched_positions)} confirmed positions (${new_cost:.2f}), "
-        f"{max(0, phantoms)} phantom positions removed "
-        f"(phantom cost: ${max(0, old_cost - new_cost):.2f})"
+        f"RECONCILE: {len(new_positions)} positions, "
+        f"${total_cost:.2f} invested, ${total_value:.2f} value, ${total_pnl:+.2f} pnl"
+        f"{f', {discovered} NEW discovered' if discovered else ''}"
+        f"{f', {closed} resolved on-chain' if closed else ''}"
     )
 
 
@@ -958,6 +1015,7 @@ def check_position_exits():
     Check open positions for exit conditions:
     - Stop loss: position lost >30% of value → sell
     - Take profit: position gained >15% → sell
+    Uses current_value from Data API reconciliation when available.
     """
     positions = load_json(POSITIONS_FILE)
     exits_done = 0
@@ -992,7 +1050,11 @@ def check_position_exits():
 
             shares = pos.get("shares", 0)
             cost = pos.get("cost", 0)
-            current_value = shares * current_price
+
+            # Use Data API current_value if available, otherwise calculate
+            current_value = pos.get("current_value")
+            if current_value is None or current_value == 0:
+                current_value = shares * current_price
 
             # Calculate P&L percentage
             pnl_pct = (current_value - cost) / cost if cost > 0 else 0
@@ -1113,8 +1175,17 @@ def sell_position(pos: dict, market: dict, pt: dict, current_price: float) -> bo
 # Position management: check resolved markets, claim winnings
 # ---------------------------------------------------------------------------
 
+def fetch_market_by_condition(condition_id: str) -> dict | None:
+    """Fetch market by conditionId — more reliable than slug."""
+    data = api_get(f"{GAMMA_API}/markets", {"conditionId": condition_id})
+    if isinstance(data, list) and data:
+        return data[0]
+    return None
+
+
 def check_positions_resolved():
-    """Check all open positions to see if their markets have resolved."""
+    """Check all open positions to see if their markets have resolved.
+    Uses conditionId for lookup (not slug) to avoid wrong market matches."""
     positions = load_json(POSITIONS_FILE)
     updated = False
     total_claimed = 0.0
@@ -1123,14 +1194,48 @@ def check_positions_resolved():
         if pos.get("status") != "open":
             continue
 
+        condition_id = pos.get("condition_id", "")
         slug = pos.get("slug", "")
-        if not slug:
+        if not condition_id and not slug:
             continue
 
         try:
-            market = fetch_market_by_slug(slug)
+            # Prefer conditionId lookup, fall back to slug
+            market = None
+            if condition_id:
+                market = fetch_market_by_condition(condition_id)
+            if market is None and slug:
+                market = fetch_market_by_slug(slug)
             if market is None:
                 continue
+
+            # Sanity check 1: does the returned market match our position?
+            market_question = market.get("question", "").lower()
+            pos_market = pos.get("market", "").lower()
+            if pos_market and market_question and "unknown" not in pos_market:
+                pos_words = set(w for w in pos_market.split() if len(w) > 3)
+                market_words = set(w for w in market_question.split() if len(w) > 3)
+                if pos_words and market_words and not pos_words.intersection(market_words):
+                    log.warning(
+                        f"Market mismatch! Position: '{pos_market[:40]}' vs "
+                        f"API returned: '{market_question[:40]}' — skipping"
+                    )
+                    continue
+
+            # Sanity check 2: if market endDate is ancient, don't trust it
+            api_end = market.get("endDate", "")
+            if api_end:
+                try:
+                    end_dt = datetime.fromisoformat(api_end.replace("Z", "+00:00"))
+                    days_ago = (datetime.now(timezone.utc) - end_dt).total_seconds() / 86400
+                    if days_ago > 7:
+                        log.warning(
+                            f"Stale market returned for '{pos_market[:40]}' "
+                            f"(ended {days_ago:.0f}d ago) — skipping resolved check"
+                        )
+                        continue
+                except (ValueError, TypeError):
+                    pass
 
             closed = market.get("closed", False)
             resolved = market.get("resolved", False)
@@ -1656,8 +1761,7 @@ def main():
     log.info(f"Scan interval: {SCAN_INTERVAL}s | Report interval: {REPORT_INTERVAL}s")
     log.info("")
 
-    # Fase 0: Reconcile positions on startup
-    log.info("Running position reconciliation...")
+    # Fase 0: Initial reconciliation
     try:
         reconcile_positions()
     except Exception as e:
@@ -1678,10 +1782,10 @@ def main():
             # Reset error counter on successful cycle start
             state["consecutive_errors"] = 0
 
-            # 1. Check resolved positions (every 5 min)
+            # 1. Reconcile & check positions (every 5 min)
             if should_run(state, "last_position_check", POSITION_CHECK_INTERVAL):
                 try:
-                    check_positions_resolved()
+                    reconcile_positions()
                     cancel_stale_orders()
                     state["last_position_check"] = now_str
                 except Exception as e:
