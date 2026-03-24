@@ -18,6 +18,9 @@ import time
 import logging
 import hashlib
 from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+load_dotenv()
 from difflib import SequenceMatcher
 from typing import Optional
 
