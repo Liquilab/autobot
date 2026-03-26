@@ -1,18 +1,25 @@
 """
-Research Loop v2 - Simplified learning for the trading bot.
+Research Loop v5 - Claude als mentor & coach met tools.
 
-v2 changes (after quant review):
-- Focus on per-source P&L tracking (the only thing that matters with <50 trades)
-- Drop complex calibration-based parameter tuning (noise with small N)
-- Binary decisions: after 20 trades per source, block sources with negative ROI
-- Run every 2 hours as safety net (quick_learn runs per-trade in the bot)
+Claude krijgt de rol van top trading coach. Hij kan:
+- Actuele crypto prijzen ophalen (Binance)
+- Sportsbook odds checken (Odds API)
+- Polymarket markten scannen (Gamma API)
+- Vorige logboek entries lezen voor continuïteit
+
+Elke 2 uur:
+1. Claude krijgt alle data + tools
+2. Claude analyseert, haalt extra info op waar nodig
+3. Claude geeft advies en past parameters aan
+4. Sessie wordt geschreven naar lokaal logboek
 """
 
+import os
 import json
 import logging
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import defaultdict
 
 log = logging.getLogger("autobot")
 
@@ -22,7 +29,7 @@ STRATEGY_FILE = DATA_DIR / "strategy_params.json"
 PNL_FILE = DATA_DIR / "pnl.json"
 TRADES_FILE = DATA_DIR / "trades.json"
 POSITIONS_FILE = DATA_DIR / "positions.json"
-RESEARCH_DIR = BASE_DIR / "reports" / "research"
+LOGBOOK_FILE = BASE_DIR / "reports" / "logboek.md"
 
 
 def load_json(path):
@@ -30,7 +37,7 @@ def load_json(path):
         with open(path) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return []
+        return [] if str(path).endswith(".json") else {}
 
 
 def save_json(path, data):
@@ -39,271 +46,531 @@ def save_json(path, data):
         json.dump(data, f, indent=2, default=str)
 
 
-def load_strategy_params():
+# ---------------------------------------------------------------------------
+# Tools die Claude kan aanroepen
+# ---------------------------------------------------------------------------
+
+TOOLS = [
+    {
+        "name": "get_crypto_prices",
+        "description": "Haal actuele crypto prijzen op van Binance. Geeft BTC, ETH en optioneel andere pairs.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbols": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Lijst van trading pairs, bijv. ['BTCUSDT', 'ETHUSDT']"
+                }
+            },
+            "required": ["symbols"]
+        }
+    },
+    {
+        "name": "get_polymarket_markets",
+        "description": "Zoek actieve Polymarket markten. Kan filteren op zoekterm.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "search": {
+                    "type": "string",
+                    "description": "Zoekterm om markten te filteren, bijv. 'Bitcoin' of 'NBA'"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max aantal resultaten (default 20)"
+                }
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "get_sportsbook_odds",
+        "description": "Haal sportsbook odds op van the-odds-api.com voor een specifieke sport.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sport": {
+                    "type": "string",
+                    "description": "Sport key, bijv. 'basketball_nba', 'icehockey_nhl', 'tennis_atp_miami_open'"
+                }
+            },
+            "required": ["sport"]
+        }
+    },
+    {
+        "name": "get_market_detail",
+        "description": "Haal gedetailleerde info op over een specifieke Polymarket markt via slug.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "slug": {
+                    "type": "string",
+                    "description": "Market slug, bijv. 'will-bitcoin-reach-100k'"
+                }
+            },
+            "required": ["slug"]
+        }
+    },
+]
+
+
+def execute_tool(name: str, input_data: dict) -> str:
+    """Voer een tool uit en geef het resultaat als string terug."""
     try:
-        with open(STRATEGY_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return get_default_params()
+        if name == "get_crypto_prices":
+            symbols = input_data.get("symbols", ["BTCUSDT", "ETHUSDT"])
+            results = {}
+            for sym in symbols[:10]:
+                r = requests.get(
+                    "https://api.binance.com/api/v3/ticker/price",
+                    params={"symbol": sym}, timeout=10
+                )
+                if r.status_code == 200:
+                    results[sym] = float(r.json()["price"])
+            return json.dumps(results)
+
+        elif name == "get_polymarket_markets":
+            search = input_data.get("search", "")
+            limit = input_data.get("limit", 20)
+            params = {
+                "active": "true", "closed": "false",
+                "limit": min(limit, 50),
+                "order": "volume24hr", "ascending": "false",
+            }
+            if search:
+                params["tag"] = search
+            r = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params=params, timeout=15
+            )
+            if r.status_code == 200:
+                markets = r.json()
+                summary = []
+                for m in markets[:limit]:
+                    summary.append({
+                        "question": m.get("question", "")[:100],
+                        "slug": m.get("slug", ""),
+                        "outcomePrices": m.get("outcomePrices", ""),
+                        "volume24hr": round(float(m.get("volume24hr", 0)), 0),
+                        "endDate": m.get("endDate", "")[:10],
+                        "negRisk": m.get("negRisk", False),
+                    })
+                return json.dumps(summary, indent=2)
+            return f"Error: {r.status_code}"
+
+        elif name == "get_sportsbook_odds":
+            sport = input_data.get("sport", "basketball_nba")
+            api_key = os.getenv("ODDS_API_KEY", "")
+            if not api_key:
+                return "ODDS_API_KEY niet beschikbaar"
+            r = requests.get(
+                f"https://api.the-odds-api.com/v4/sports/{sport}/odds",
+                params={
+                    "apiKey": api_key,
+                    "regions": "us,eu",
+                    "markets": "h2h,totals",
+                    "oddsFormat": "decimal",
+                },
+                timeout=15
+            )
+            if r.status_code == 200:
+                remaining = r.headers.get("x-requests-remaining", "?")
+                events = r.json()
+                summary = []
+                for e in events[:15]:
+                    summary.append({
+                        "teams": f"{e.get('home_team','')} vs {e.get('away_team','')}",
+                        "commence": e.get("commence_time", "")[:16],
+                        "bookmakers": len(e.get("bookmakers", [])),
+                    })
+                return json.dumps({"remaining_credits": remaining, "events": summary}, indent=2)
+            return f"Error: {r.status_code} - {r.text[:200]}"
+
+        elif name == "get_market_detail":
+            slug = input_data.get("slug", "")
+            r = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"slug": slug}, timeout=15
+            )
+            if r.status_code == 200:
+                markets = r.json()
+                if markets:
+                    m = markets[0]
+                    return json.dumps({
+                        "question": m.get("question", ""),
+                        "outcomePrices": m.get("outcomePrices", ""),
+                        "volume24hr": m.get("volume24hr", 0),
+                        "liquidity": m.get("liquidityClob", 0),
+                        "endDate": m.get("endDate", ""),
+                        "description": m.get("description", "")[:500],
+                    }, indent=2)
+            return "Markt niet gevonden"
+
+        return f"Onbekende tool: {name}"
+
+    except Exception as e:
+        return f"Tool error: {e}"
 
 
-def get_default_params():
-    return {
-        "version": 1,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "source_stats": {},
-        "blocked_sources": [],
-        "position_sizing": {
-            "max_fraction": 0.15,
-            "kelly_multiplier": 0.5,
-        },
-        "total_resolved_trades": 0,
-        "overall_roi": 0.0,
-    }
+# ---------------------------------------------------------------------------
+# Logboek
+# ---------------------------------------------------------------------------
+
+def read_recent_logbook(max_entries: int = 3) -> str:
+    """Lees de laatste logboek entries voor continuïteit."""
+    if not LOGBOOK_FILE.exists():
+        return "Geen eerdere sessies."
+
+    content = LOGBOOK_FILE.read_text()
+    # Split op sessie headers
+    sessions = content.split("\n---\n")
+    recent = sessions[-max_entries:] if len(sessions) > max_entries else sessions
+    return "\n---\n".join(recent)
 
 
-def analyze_by_source(pnl: list, trades: list) -> dict:
-    """Analyze P&L broken down by signal source."""
-    # Build trade lookup for signal_source
-    trade_lookup = {}
-    for t in trades:
-        key = t.get("market", "")
-        trade_lookup[key] = t
+def append_to_logbook(entry: str):
+    """Voeg een nieuwe sessie toe aan het logboek."""
+    LOGBOOK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    separator = "\n---\n" if LOGBOOK_FILE.exists() and LOGBOOK_FILE.stat().st_size > 0 else ""
+    with open(LOGBOOK_FILE, "a") as f:
+        f.write(f"{separator}{entry}")
 
-    source_stats = defaultdict(lambda: {
-        "trades": 0, "wins": 0, "losses": 0,
-        "total_cost": 0.0, "total_profit": 0.0,
-    })
 
+# ---------------------------------------------------------------------------
+# Bouw de data samen voor Claude
+# ---------------------------------------------------------------------------
+
+def build_trading_summary(pnl, trades, positions, current_params):
+    """Bouw een compacte samenvatting van alle trading data."""
+
+    # P&L per bron
+    source_stats = {}
     for record in pnl:
-        market = record.get("market", "")
-        # Get source from PnL record first, then from trade lookup
-        source = record.get("signal_source", "")
-        if not source:
-            trade = trade_lookup.get(market, {})
-            source = trade.get("signal_source", "heuristic")
+        src = record.get("signal_source", "unknown")
+        if src not in source_stats:
+            source_stats[src] = {"w": 0, "l": 0, "profit": 0.0, "cost": 0.0}
+        if record.get("profit", 0) > 0:
+            source_stats[src]["w"] += 1
+        else:
+            source_stats[src]["l"] += 1
+        source_stats[src]["profit"] += record.get("profit", 0)
+        source_stats[src]["cost"] += record.get("cost", 0)
 
-        s = source_stats[source]
-        s["trades"] += 1
-        won = record.get("won", False)
-        s["wins"] += 1 if won else 0
-        s["losses"] += 0 if won else 1
-        s["total_cost"] += record.get("cost", 0)
-        s["total_profit"] += record.get("profit", 0)
+    source_summary = ""
+    for src, s in sorted(source_stats.items(), key=lambda x: -x[1]["profit"]):
+        n = s["w"] + s["l"]
+        wr = s["w"] / n * 100 if n else 0
+        roi = s["profit"] / s["cost"] * 100 if s["cost"] else 0
+        source_summary += f"  {src}: {s['w']}W/{s['l']}L ({wr:.0f}% WR) profit=${s['profit']:.2f} ROI={roi:.1f}%\n"
 
-    # Compute derived stats
-    result = {}
-    for source, s in source_stats.items():
-        n = s["trades"]
-        result[source] = {
-            "trades": n,
-            "wins": s["wins"],
-            "losses": s["losses"],
-            "total_cost": round(s["total_cost"], 2),
-            "total_profit": round(s["total_profit"], 2),
-            "win_rate": round(s["wins"] / n, 3) if n > 0 else 0,
-            "roi": round(s["total_profit"] / s["total_cost"], 4) if s["total_cost"] > 0 else 0,
-        }
-
-    return result
-
-
-def analyze_by_category(pnl: list, trades: list) -> dict:
-    """Simple category breakdown."""
-    trade_lookup = {}
-    for t in trades:
-        key = t.get("market", "")
-        trade_lookup[key] = t
-
-    cat_stats = defaultdict(lambda: {
-        "trades": 0, "wins": 0, "losses": 0,
-        "total_cost": 0.0, "total_profit": 0.0,
-    })
-
+    # Subcategorie stats
+    subcat_stats = {}
     for record in pnl:
-        market = record.get("market", "")
-        trade = trade_lookup.get(market, {})
-        category = trade.get("category", "unknown")
+        market = record.get("market", "").lower()
+        src = record.get("signal_source", "unknown")
+        if "o/u" in market:
+            sub = f"{src}:O/U"
+        elif " vs " in market or " vs. " in market:
+            sub = f"{src}:moneyline"
+        elif "bitcoin" in market or "ethereum" in market:
+            sub = f"{src}:crypto"
+        else:
+            sub = f"{src}:other"
+        if sub not in subcat_stats:
+            subcat_stats[sub] = {"w": 0, "l": 0, "profit": 0.0}
+        if record.get("profit", 0) > 0:
+            subcat_stats[sub]["w"] += 1
+        else:
+            subcat_stats[sub]["l"] += 1
+        subcat_stats[sub]["profit"] += record.get("profit", 0)
 
-        s = cat_stats[category]
-        s["trades"] += 1
-        won = record.get("won", False)
-        s["wins"] += 1 if won else 0
-        s["losses"] += 0 if won else 1
-        s["total_cost"] += record.get("cost", 0)
-        s["total_profit"] += record.get("profit", 0)
+    subcat_summary = ""
+    for sub, s in sorted(subcat_stats.items(), key=lambda x: -x[1]["profit"]):
+        n = s["w"] + s["l"]
+        wr = s["w"] / n * 100 if n else 0
+        subcat_summary += f"  {sub}: {s['w']}W/{s['l']}L ({wr:.0f}%) ${s['profit']:+.2f}\n"
 
-    result = {}
-    for cat, s in cat_stats.items():
-        n = s["trades"]
-        result[cat] = {
-            "trades": n,
-            "wins": s["wins"],
-            "losses": s["losses"],
-            "total_cost": round(s["total_cost"], 2),
-            "total_profit": round(s["total_profit"], 2),
-            "win_rate": round(s["wins"] / n, 3) if n > 0 else 0,
-            "roi": round(s["total_profit"] / s["total_cost"], 4) if s["total_cost"] > 0 else 0,
-        }
+    # Portfolio: haal echte waarden op via API
+    open_pos = [p for p in positions if p.get("status") == "open"]
+    total_cost = sum(p.get("cost", 0) for p in open_pos)
+    try:
+        # Data API voor echte positie waarde, CLOB voor cash
+        funder = os.getenv("FUNDER_ADDRESS", "").lower()
+        if funder:
+            r = requests.get(f"https://data-api.polymarket.com/positions",
+                             params={"user": funder}, timeout=15)
+            r.raise_for_status()
+            total_value = sum(float(p.get("currentValue", 0)) for p in r.json()
+                              if float(p.get("size", 0)) >= 0.1)
+        else:
+            total_value = sum(p.get("current_value", 0) for p in open_pos)
+        # Cash balance
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import BalanceAllowanceParams
+        clob = ClobClient("https://clob.polymarket.com", key=os.getenv("PRIVATE_KEY"),
+                           chain_id=137, signature_type=2, funder=os.getenv("FUNDER_ADDRESS"))
+        clob.set_api_creds(clob.derive_api_key())
+        cash_balance = int(clob.get_balance_allowance(
+            BalanceAllowanceParams(asset_type="COLLATERAL", signature_type=2)
+        ).get("balance", "0")) / 1e6
+    except Exception as e:
+        log.debug(f"Portfolio fetch failed: {e}")
+        total_value = sum(p.get("current_value", 0) for p in open_pos)
+        cash_balance = 0.0
+    portfolio_total = total_value + cash_balance
 
-    return result
+    pos_summary = ""
+    for p in sorted(open_pos, key=lambda x: -x.get("cost", 0))[:15]:
+        pnl_val = p.get("unrealized_pnl", 0)
+        pos_summary += f"  {p['market'][:55]} | {p.get('side','?')} | ${p.get('cost',0):.2f} | ${pnl_val:+.2f} | {p.get('signal_source','?')}\n"
+
+    # Laatste trades
+    recent = ""
+    for t in trades[-15:]:
+        recent += f"  {t.get('timestamp','')[:16]} {t.get('side','?')} {t.get('market','')[:45]} ${t.get('cost',0):.2f} [{t.get('signal_source','?')}] div={t.get('divergence',0):.2%}\n"
+
+    # Correlatie check
+    from collections import defaultdict
+    event_losses = defaultdict(lambda: {"n": 0, "loss": 0.0})
+    for record in pnl:
+        if record.get("profit", 0) >= 0:
+            continue
+        name = record.get("market", "").lower()
+        for sep in [":", " o/u"]:
+            name = name.split(sep)[0]
+        event_losses[name.strip()]["n"] += 1
+        event_losses[name.strip()]["loss"] += record.get("profit", 0)
+    corr = [f"  {e}: {s['n']} bets, ${s['loss']:.2f}" for e, s in event_losses.items() if s["n"] >= 2]
+
+    return f"""## Portfolio (LIVE data van Polymarket API)
+- TOTAAL: ${portfolio_total:.2f} (cash: ${cash_balance:.2f} + posities: ${total_value:.2f})
+- Open posities: {len(open_pos)}, cost: ${total_cost:.2f}, waarde: ${total_value:.2f}, unrealized: ${total_value - total_cost:+.2f}
+- Resolved trades: {len(pnl)}, realized P&L: ${sum(r.get('profit', 0) for r in pnl):.2f}
+
+## Per bron
+{source_summary}
+## Per subcategorie
+{subcat_summary}
+## Open posities (top 15)
+{pos_summary}
+## Laatste 15 trades
+{recent}
+## Gecorreleerde verliezen
+{chr(10).join(corr) if corr else "  Geen"}
+
+## Huidige parameters
+{json.dumps(current_params, indent=2)}"""
 
 
-def update_strategy_params(source_stats: dict, current_params: dict) -> tuple[dict, list]:
-    """
-    Simple learning: block bad sources, keep good ones.
-    No micro-adjustments of edge parameters (noise with small N).
-    """
-    new_params = json.loads(json.dumps(current_params))
-    insights = []
+# ---------------------------------------------------------------------------
+# Claude coach sessie
+# ---------------------------------------------------------------------------
 
-    # Update source_stats in params
-    new_params["source_stats"] = {}
-    blocked = new_params.get("blocked_sources", [])
+def run_coach_session(pnl, trades, positions, current_params):
+    """Draai een volledige coaching sessie met Claude."""
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        log.error("ANTHROPIC_API_KEY niet gezet — kan geen AI coaching draaien")
+        return None
 
-    total_trades = 0
-    total_cost = 0.0
-    total_profit = 0.0
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
 
-    for source, stats in source_stats.items():
-        new_params["source_stats"][source] = stats
-        total_trades += stats["trades"]
-        total_cost += stats["total_cost"]
-        total_profit += stats["total_profit"]
+    # Data samenvatting
+    trading_summary = build_trading_summary(pnl, trades, positions, current_params)
 
-        n = stats["trades"]
-        roi = stats["roi"]
-        win_rate = stats["win_rate"]
+    # Vorige sessies voor continuïteit
+    prev_sessions = read_recent_logbook(3)
 
-        if n >= 20 and roi < 0 and source not in blocked:
-            blocked.append(source)
-            insights.append(
-                f"GEBLOKKEERD: '{source}' na {n} trades, "
-                f"ROI: {roi*100:.1f}%, win rate: {win_rate*100:.0f}%"
-            )
-        elif n >= 10:
-            status = "WINSTGEVEND" if roi > 0 else "VERLIESGEVEND"
-            insights.append(
-                f"{status}: '{source}' - {n} trades, "
-                f"ROI: {roi*100:.1f}%, win rate: {win_rate*100:.0f}%"
-            )
-        elif n >= 3:
-            insights.append(
-                f"LEREN: '{source}' - {n} trades (min 20 voor beslissing), "
-                f"ROI: {roi*100:.1f}%, win rate: {win_rate*100:.0f}%"
-            )
+    system_prompt = """Je bent de mentor en top trading coach van een autonome Polymarket trading bot.
 
-    new_params["blocked_sources"] = blocked
-    new_params["total_resolved_trades"] = total_trades
-    new_params["overall_roi"] = round(total_profit / total_cost, 4) if total_cost > 0 else 0
-    new_params["version"] = current_params.get("version", 0) + 1
-    new_params["updated_at"] = datetime.now(timezone.utc).isoformat()
+DOEL: Groei $180 startkapitaal naar $1.000 in 90 dagen (deadline: 21 juni 2026).
 
-    if total_trades > 0:
-        overall_win_rate = sum(s["wins"] for s in source_stats.values()) / total_trades
-        insights.append(
-            f"OVERALL: {total_trades} trades, "
-            f"ROI: {new_params['overall_roi']*100:.1f}%, "
-            f"win rate: {overall_win_rate*100:.0f}%, "
-            f"P&L: ${total_profit:+.2f}"
+JE ROL:
+- Analyseer de trading resultaten met een scherp oog
+- Gebruik je tools om actuele marktdata op te halen als dat je analyse verbetert
+- Geef concrete, actionable adviezen
+- Pas de strategie parameters aan
+- Wees eerlijk en direct — als iets niet werkt, zeg het
+
+JE HEBT TOOLS:
+- get_crypto_prices: actuele crypto prijzen (Binance)
+- get_sportsbook_odds: sportsbook odds (the-odds-api.com)
+- get_polymarket_markets: actieve Polymarket markten
+- get_market_detail: details van een specifieke markt
+
+GEBRUIK JE TOOLS als je:
+- Wilt checken of open posities nog kans maken (haal actuele prijzen op)
+- Wilt zien welke markten er nu beschikbaar zijn
+- Odds wilt vergelijken met Polymarket prijzen
+
+AAN HET EINDE van je analyse, geef ALTIJD een JSON blok met parameter updates:
+
+```json
+{
+    "source_kelly": {"bron": 0.XX},
+    "source_thresholds": {"bron": 0.XX},
+    "source_max_fraction": {"bron": 0.XX},
+    "blocked_sources": ["bron"],
+    "blocked_subcategories": ["subcat"],
+    "position_sizing": {"max_fraction": 0.XX, "kelly_multiplier": 0.XX},
+    "max_theme_fraction": 0.XX,
+    "stop_loss_pct": 0.XX
+}
+```
+
+Schrijf je analyse in het Nederlands. Wees concreet, geen vage adviezen."""
+
+    user_message = f"""## Vorige coaching sessies
+{prev_sessions}
+
+## Huidige trading data
+{trading_summary}
+
+Analyseer de situatie. Haal actuele marktdata op als dat relevant is. Geef je coaching advies en parameter updates."""
+
+    messages = [{"role": "user", "content": user_message}]
+
+    # Multi-turn loop met tool use
+    full_response_text = ""
+    max_turns = 10
+
+    for turn in range(max_turns):
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4000,
+            system=system_prompt,
+            tools=TOOLS,
+            messages=messages,
         )
 
-    return new_params, insights
+        # Verwerk response content blocks
+        assistant_content = response.content
+        messages.append({"role": "assistant", "content": assistant_content})
+
+        # Check voor tool calls
+        tool_calls = [b for b in assistant_content if b.type == "tool_use"]
+        text_blocks = [b for b in assistant_content if b.type == "text"]
+
+        for tb in text_blocks:
+            full_response_text += tb.text + "\n"
+
+        if not tool_calls or response.stop_reason == "end_turn":
+            break
+
+        # Voer tools uit
+        tool_results = []
+        for tc in tool_calls:
+            log.info(f"COACH TOOL: {tc.name}({json.dumps(tc.input)[:100]})")
+            result = execute_tool(tc.name, tc.input)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tc.id,
+                "content": result[:3000],  # cap tool output
+            })
+
+        messages.append({"role": "user", "content": tool_results})
+
+    return full_response_text
 
 
-def write_research_note(source_stats: dict, category_stats: dict,
-                        insights: list, new_params: dict):
-    """Write a research note in Dutch."""
-    RESEARCH_DIR.mkdir(parents=True, exist_ok=True)
-    now = datetime.now(timezone.utc)
-    filename = now.strftime("research-%Y-%m-%d-%H-%M.md")
-    filepath = RESEARCH_DIR / filename
+def extract_params_from_response(text: str) -> dict | None:
+    """Extract JSON parameters from Claude's response."""
+    try:
+        # Zoek JSON blok in de response
+        if "```json" in text:
+            json_str = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            # Probeer elk code block
+            for block in text.split("```")[1::2]:
+                block = block.strip()
+                if block.startswith("json"):
+                    block = block[4:].strip()
+                if block.startswith("{"):
+                    json_str = block
+                    break
+            else:
+                return None
+        else:
+            # Zoek naar { ... } patroon
+            start = text.rfind("{")
+            end = text.rfind("}") + 1
+            if start >= 0 and end > start:
+                json_str = text[start:end]
+            else:
+                return None
 
-    lines = [
-        f"# Research Nota v2: {now.strftime('%d %B %Y, %H:%M UTC')}",
-        "",
-        "## Samenvatting",
-        f"- Totaal resolved trades: {new_params.get('total_resolved_trades', 0)}",
-        f"- Overall ROI: {new_params.get('overall_roi', 0)*100:.1f}%",
-        f"- Geblokkeerde bronnen: {', '.join(new_params.get('blocked_sources', [])) or 'geen'}",
-        f"- Strategy versie: {new_params.get('version', 1)}",
-        "",
-    ]
+        return json.loads(json_str)
+    except (json.JSONDecodeError, UnboundLocalError):
+        log.warning("Kon geen JSON parameters uit Claude response extraheren")
+        return None
 
-    if source_stats:
-        lines.append("## Resultaten per Signaal Bron")
-        lines.append("| Bron | Trades | Wins | Losses | Kosten | Winst | ROI | Win% |")
-        lines.append("|------|--------|------|--------|--------|-------|-----|------|")
-        for src, s in sorted(source_stats.items(), key=lambda x: -x[1]["trades"]):
-            blocked = " GEBLOKKEERD" if src in new_params.get("blocked_sources", []) else ""
-            lines.append(
-                f"| {src}{blocked} | {s['trades']} | {s['wins']} | {s['losses']} | "
-                f"${s['total_cost']:.2f} | ${s['total_profit']:.2f} | "
-                f"{s['roi']*100:.1f}% | {s['win_rate']*100:.0f}% |"
-            )
-        lines.append("")
 
-    if category_stats:
-        lines.append("## Resultaten per Categorie")
-        lines.append("| Categorie | Trades | Wins | ROI | Win% |")
-        lines.append("|-----------|--------|------|-----|------|")
-        for cat, s in sorted(category_stats.items(), key=lambda x: -x[1]["trades"]):
-            lines.append(
-                f"| {cat} | {s['trades']} | {s['wins']} | "
-                f"{s['roi']*100:.1f}% | {s['win_rate']*100:.0f}% |"
-            )
-        lines.append("")
-
-    if insights:
-        lines.append("## Inzichten & Beslissingen")
-        for i, insight in enumerate(insights, 1):
-            lines.append(f"{i}. {insight}")
-        lines.append("")
-
-    lines.append("## Strategie Parameters")
-    lines.append("```json")
-    lines.append(json.dumps(new_params, indent=2))
-    lines.append("```")
-
-    filepath.write_text("\n".join(lines))
-    log.info(f"Research note written: {filepath}")
-    return filepath
-
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 def run_research_loop():
     """
-    Main entry point. Called every 2 hours by the bot.
-    Analyzes all resolved trades, updates source stats, blocks bad sources.
+    Elke 2 uur: stuur data naar Claude coach, krijg analyse + parameter updates terug.
+    Schrijf sessie naar lokaal logboek.
     """
-    log.info("=== RESEARCH LOOP v2: analyzing resolved trades ===")
+    log.info("=== AI COACH SESSIE v5 ===")
 
     pnl = load_json(PNL_FILE)
     trades = load_json(TRADES_FILE)
+    positions = load_json(POSITIONS_FILE)
 
-    if not pnl:
-        log.info("No resolved trades yet — nothing to learn from.")
+    if not pnl or len(pnl) < 3:
+        log.info("Te weinig data voor coaching sessie.")
         return
 
-    # 1. Analyze by source
-    source_stats = analyze_by_source(pnl, trades)
+    current_params = load_json(STRATEGY_FILE) or {}
 
-    # 2. Analyze by category
-    category_stats = analyze_by_category(pnl, trades)
+    # Draai coaching sessie
+    log.info(f"Start coaching sessie met {len(pnl)} resolved trades...")
+    response_text = run_coach_session(pnl, trades, positions, current_params)
 
-    # 3. Load current params and update
-    current_params = load_strategy_params()
-    new_params, insights = update_strategy_params(source_stats, current_params)
+    if not response_text:
+        log.error("Coaching sessie mislukt")
+        return
 
-    # 4. Save updated params
-    save_json(STRATEGY_FILE, new_params)
-    log.info(f"Strategy params updated to v{new_params.get('version', '?')}")
+    # Extract en pas parameters aan
+    new_params_update = extract_params_from_response(response_text)
+    if new_params_update:
+        new_params = json.loads(json.dumps(current_params))
+        for key in ["source_kelly", "source_thresholds", "source_max_fraction",
+                     "blocked_sources", "blocked_subcategories", "position_sizing"]:
+            if key in new_params_update:
+                new_params[key] = new_params_update[key]
+        if "max_theme_fraction" in new_params_update:
+            new_params["max_theme_fraction"] = new_params_update["max_theme_fraction"]
+        if "stop_loss_pct" in new_params_update:
+            new_params["stop_loss_pct"] = new_params_update["stop_loss_pct"]
 
-    # 5. Write research note
-    write_research_note(source_stats, category_stats, insights, new_params)
+        new_params["version"] = current_params.get("version", 0) + 1
+        new_params["updated_at"] = datetime.now(timezone.utc).isoformat()
+        new_params["last_coach_session"] = datetime.now(timezone.utc).isoformat()
+        save_json(STRATEGY_FILE, new_params)
+        log.info(f"Parameters bijgewerkt naar v{new_params['version']} (coach)")
+    else:
+        log.warning("Geen parameter updates geëxtraheerd uit coaching sessie")
 
-    # 6. Log insights
-    for insight in insights:
-        log.info(f"LEARNED: {insight}")
+    # Schrijf naar logboek
+    now = datetime.now(timezone.utc)
+    logbook_entry = f"""## Sessie {now.strftime('%Y-%m-%d %H:%M UTC')}
 
-    log.info("=== RESEARCH LOOP v2 complete ===")
-    return new_params
+{response_text.strip()}
+"""
+    append_to_logbook(logbook_entry)
+    log.info(f"Logboek bijgewerkt: {LOGBOOK_FILE}")
+
+    # Log samenvatting
+    for line in response_text.strip().split("\n"):
+        if line.strip():
+            log.info(f"COACH: {line.strip()[:120]}")
+            break  # Log alleen eerste niet-lege regel
+
+    log.info("=== AI COACH SESSIE v5 compleet ===")
+    return new_params_update
