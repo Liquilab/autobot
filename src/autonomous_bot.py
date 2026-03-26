@@ -25,6 +25,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
+from web3 import Web3
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     OrderArgs, PartialCreateOrderOptions, BalanceAllowanceParams
@@ -55,6 +56,13 @@ SIGNATURE_TYPE = 2  # Gnosis Safe proxy
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS")
+
+# On-chain redemption config
+POLYGON_RPC = os.getenv("POLYGON_RPC", "https://polygon-bor-rpc.publicnode.com")
+CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+NEG_RISK_ADAPTER = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+REDEEM_INTERVAL = 600  # Check for redeemable positions every 10 minutes
 
 # GitHub config
 GITHUB_PAT = os.getenv("GITHUB_PAT", "")
@@ -274,6 +282,35 @@ def get_balance() -> float:
         return 0.0
 
 
+def get_portfolio_value() -> tuple[float, float, float]:
+    """Get total portfolio value: (cash, positions_value, total).
+    Queries CLOB for cash and Data API for position values."""
+    cash = get_balance()
+    positions_value = 0.0
+    try:
+        if FUNDER_ADDRESS:
+            resp = requests.get(
+                f"{DATA_API}/positions",
+                params={"user": FUNDER_ADDRESS.lower()},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for p in resp.json():
+                size = float(p.get("size", 0))
+                if size < 0.1:
+                    continue
+                positions_value += float(p.get("currentValue", 0))
+    except Exception as e:
+        log.debug(f"Portfolio value fetch failed: {e}")
+        # Fallback to local positions
+        positions = load_json(POSITIONS_FILE)
+        positions_value = sum(
+            p.get("current_value", 0) for p in positions if p.get("status") == "open"
+        )
+    total = cash + positions_value
+    return cash, positions_value, total
+
+
 # ---------------------------------------------------------------------------
 # Market fetching
 # ---------------------------------------------------------------------------
@@ -328,6 +365,30 @@ def fetch_market_by_slug(slug: str) -> dict | None:
     if isinstance(data, list) and data:
         return data[0]
     return None
+
+
+_tick_size_cache: dict[str, str] = {}
+
+def get_tick_size(token_id: str, neg_risk: bool = False) -> str:
+    """Query actual tick size from CLOB API. Caches results."""
+    if token_id in _tick_size_cache:
+        return _tick_size_cache[token_id]
+    try:
+        r = requests.get(
+            f"{CLOB_URL}/tick-size",
+            params={"token_id": token_id},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            ts = str(r.json().get("minimum_tick_size", "0.01"))
+            _tick_size_cache[token_id] = ts
+            return ts
+    except Exception as e:
+        log.debug(f"Tick size query failed for {token_id[:16]}: {e}")
+    # Fallback
+    fallback = "0.001" if neg_risk else "0.01"
+    _tick_size_cache[token_id] = fallback
+    return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -425,11 +486,28 @@ def half_kelly(prob_win: float, price: float) -> float:
     return max(0.0, f / 2.0)
 
 
-def position_size(bankroll: float, prob_win: float, price: float) -> float:
-    """Dollar amount to bet, capped by max fraction and cash reserve."""
+def position_size(bankroll: float, prob_win: float, price: float,
+                   source: str = "") -> float:
+    """Dollar amount to bet, using learned Kelly and max_fraction per source."""
     available = bankroll * (1.0 - CASH_RESERVE_FRACTION)
-    kelly = half_kelly(prob_win, price)
-    fraction = min(kelly, MAX_POSITION_FRACTION)
+
+    # Load learned parameters
+    kelly_mult = 0.5
+    max_frac = MAX_POSITION_FRACTION
+    try:
+        if STRATEGY_FILE.exists():
+            with open(STRATEGY_FILE) as f:
+                params = json.load(f)
+            if source:
+                kelly_mult = params.get("source_kelly", {}).get(source, 0.5)
+                max_frac = params.get("source_max_fraction", {}).get(source, MAX_POSITION_FRACTION)
+    except Exception:
+        pass
+
+    raw_kelly = half_kelly(prob_win, price)
+    # Apply source-specific Kelly multiplier (half_kelly already halves, so adjust ratio)
+    adjusted_kelly = raw_kelly * (kelly_mult / 0.5)
+    fraction = min(adjusted_kelly, max_frac)
     return round(available * fraction, 2)
 
 
@@ -485,7 +563,8 @@ def reconcile_positions():
     # Load current local positions
     old_positions = load_json(POSITIONS_FILE)
     old_open = {p.get("token_id"): p for p in old_positions if p.get("status") == "open"}
-    resolved_positions = [p for p in old_positions if p.get("status") in ("resolved", "sold")]
+    resolved_positions = [p for p in old_positions if p.get("status") not in ("open", None)]
+    resolved_token_ids = {p.get("token_id") for p in resolved_positions if p.get("token_id")}
 
     new_positions = []
     updated = 0
@@ -512,6 +591,10 @@ def reconcile_positions():
             new_positions.append(pos)
             updated += 1
         else:
+            # Skip positions that were already resolved/dead — don't rediscover
+            if token_id in resolved_token_ids:
+                continue
+
             # NEW position — the bot didn't know about this fill
             # This happens when an order was filled but the bot thought it wasn't
             discovered += 1
@@ -685,42 +768,337 @@ def _poll_order_fill(order_id: str, timeout: int = 30) -> bool:
 # Fase 2: Redeem resolved positions
 # ---------------------------------------------------------------------------
 
-def redeem_position(condition_id: str) -> bool:
+RELAYER_URL = "https://relayer-v2.polymarket.com"
+
+
+def get_web3():
+    """Get Web3 connection to Polygon (PoA chain)."""
+    from web3.middleware import ExtraDataToPOAMiddleware
+    rpcs = [POLYGON_RPC, "https://rpc.ankr.com/polygon", "https://polygon.drpc.org"]
+    for rpc in rpcs:
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc))
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            if w3.is_connected():
+                return w3
+        except Exception:
+            continue
+    return None
+
+
+def _get_clob_api_creds():
+    """Get CLOB API credentials for relayer authentication."""
+    client = get_client()
+    return client.creds
+
+
+def _build_relayer_headers(api_creds, method: str, path: str, body: str = ""):
+    """Build HMAC authentication headers for the relayer (same format as CLOB Builder keys)."""
+    import hmac as hmac_mod
+    import hashlib
+    import base64
+
+    timestamp = str(int(time.time()))
+    message = timestamp + method + path
+    if body:
+        message += body
+
+    secret_bytes = base64.urlsafe_b64decode(api_creds.api_secret)
+    signature = base64.urlsafe_b64encode(
+        hmac_mod.new(secret_bytes, message.encode(), hashlib.sha256).digest()
+    ).decode()
+
+    return {
+        "POLY_BUILDER_API_KEY": api_creds.api_key,
+        "POLY_BUILDER_TIMESTAMP": timestamp,
+        "POLY_BUILDER_PASSPHRASE": api_creds.api_passphrase,
+        "POLY_BUILDER_SIGNATURE": signature,
+        "Content-Type": "application/json",
+    }
+
+
+def _sign_safe_tx(to: str, data: str, safe_nonce: int) -> str:
     """
-    Redeem a resolved position via the CTF contract.
-    This converts winning conditional tokens back to USDC.
+    Sign a Gnosis Safe transaction using EIP-712 typed data.
+    Returns the signature hex string.
     """
-    if not condition_id:
+    from eth_account.messages import encode_defunct
+    from eth_account import Account
+
+    safe_addr = Web3.to_checksum_address(FUNDER_ADDRESS)
+
+    # EIP-712 domain separator for Gnosis Safe
+    DOMAIN_TYPEHASH = Web3.keccak(text="EIP712Domain(uint256 chainId,address verifyingContract)")
+    domain_separator = Web3.keccak(
+        b'\x00' * 12 +  # padding
+        DOMAIN_TYPEHASH +
+        int(CHAIN_ID).to_bytes(32, "big") +
+        bytes.fromhex(safe_addr[2:].lower().zfill(64))
+    )
+    # Simpler: use eth_abi for proper encoding
+    from eth_abi import encode as abi_encode
+    domain_separator = Web3.keccak(
+        abi_encode(
+            ["bytes32", "uint256", "address"],
+            [DOMAIN_TYPEHASH, CHAIN_ID, safe_addr]
+        )
+    )
+
+    # Safe transaction typehash
+    SAFE_TX_TYPEHASH = Web3.keccak(
+        text="SafeTx(address to,uint256 value,bytes data,uint8 operation,"
+             "uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,"
+             "address gasToken,address refundReceiver,uint256 _nonce)"
+    )
+
+    # Hash the data
+    data_bytes = bytes.fromhex(data.replace("0x", "")) if data else b""
+    data_hash = Web3.keccak(data_bytes)
+
+    # Encode the Safe tx struct
+    zero_addr = "0x0000000000000000000000000000000000000000"
+    safe_tx_hash = Web3.keccak(
+        abi_encode(
+            ["bytes32", "address", "uint256", "bytes32", "uint8",
+             "uint256", "uint256", "uint256", "address", "address", "uint256"],
+            [SAFE_TX_TYPEHASH, Web3.to_checksum_address(to), 0, data_hash, 0,
+             0, 0, 0, zero_addr, zero_addr, safe_nonce]
+        )
+    )
+
+    # EIP-712 message hash
+    msg_hash = Web3.keccak(b"\x19\x01" + domain_separator + safe_tx_hash)
+
+    # Sign with private key
+    account = Account.from_key(PRIVATE_KEY)
+    signed = account.unsafe_sign_hash(msg_hash)
+
+    # Return signature in compact form (r + s + v)
+    r = signed.r.to_bytes(32, "big")
+    s = signed.s.to_bytes(32, "big")
+    v = signed.v.to_bytes(1, "big")
+    return "0x" + (r + s + v).hex()
+
+
+def _encode_redeem_calldata(condition_id: str) -> str:
+    """Encode redeemPositions calldata for the CTF contract."""
+    from eth_abi import encode as abi_encode
+    usdc_addr = Web3.to_checksum_address(USDC_E)
+    cid_bytes = bytes.fromhex(condition_id.replace("0x", "")[:64].ljust(64, "0"))
+    encoded_args = abi_encode(
+        ["address", "bytes32", "bytes32", "uint256[]"],
+        [usdc_addr, b'\x00' * 32, cid_bytes, [1, 2]]
+    )
+    return "0x01b7037c" + encoded_args.hex()
+
+
+def _redeem_via_relayer(condition_id: str, redeem_data: str) -> bool:
+    """Try redemption via Polymarket relayer (gas-free). Needs RELAYER_API_KEY env var."""
+    relayer_key = os.getenv("RELAYER_API_KEY", "")
+    if not relayer_key:
         return False
 
     try:
-        # Use the CLOB/CTF redeem endpoint if available via REST
-        # Polymarket provides a redeem API through the neg-risk adapter
-        # For now, try the strapi/data API approach
-        url = f"{CLOB_URL}/redeem"
-        headers = {}
+        from py_builder_relayer_client.builder.safe import create_struct_hash, create_safe_signature, split_and_pack_sig
+        from py_builder_relayer_client.signer import Signer as RelayerSigner
+        from py_builder_relayer_client.models import OperationType, SafeTransaction as RelayerSafeTx
+        from py_builder_relayer_client.client import build_safe_transaction_request, SafeTransactionArgs
+        from py_builder_relayer_client.config import get_contract_config
 
-        # Try using py_clob_client if it has redeem support
-        client = get_client()
+        ctf_addr = Web3.to_checksum_address(CONDITIONAL_TOKENS)
+        signer = RelayerSigner(PRIVATE_KEY, CHAIN_ID)
+        config = get_contract_config(CHAIN_ID)
 
-        # Check if client has a redeem method (varies by library version)
-        if hasattr(client, "redeem"):
-            result = client.redeem(condition_id)
-            log.info(f"Redeemed position {condition_id[:16]}...: {result}")
+        # Get Safe nonce from relayer
+        r = requests.get(
+            f"{RELAYER_URL}/nonce",
+            params={"address": WALLET_ADDRESS, "type": "SAFE"},
+            timeout=10
+        )
+        if r.status_code != 200:
+            return False
+        nonce = r.json()["nonce"]
+
+        # Build and sign request using official SDK
+        tx = RelayerSafeTx(to=ctf_addr, value="0", data=redeem_data, operation=OperationType.Call)
+        args = SafeTransactionArgs(from_address=WALLET_ADDRESS, nonce=nonce, chain_id=CHAIN_ID, transactions=[tx])
+        txn_request = build_safe_transaction_request(signer=signer, args=args, config=config, metadata="Redeem").to_dict()
+
+        headers = {
+            "RELAYER_API_KEY": relayer_key,
+            "RELAYER_API_KEY_ADDRESS": WALLET_ADDRESS,
+            "Content-Type": "application/json",
+        }
+
+        resp = requests.post(f"{RELAYER_URL}/submit", json=txn_request, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            result = resp.json()
+            log.info(f"REDEEM via relayer: {condition_id[:16]}... txID={result.get('transactionID', '?')[:20]}")
+            return True
+        else:
+            log.debug(f"Relayer rejected: {resp.status_code} {resp.text[:100]}")
+            return False
+
+    except Exception as e:
+        log.error(f"Relayer redeem error: {e}")
+        return False
+
+
+def _redeem_via_onchain(condition_id: str, redeem_data: str) -> bool:
+    """Try redemption via direct on-chain tx (needs POL for gas)."""
+    w3 = get_web3()
+    if not w3:
+        return False
+
+    wallet_cs = Web3.to_checksum_address(WALLET_ADDRESS)
+    funder_cs = Web3.to_checksum_address(FUNDER_ADDRESS)
+    ctf_cs = Web3.to_checksum_address(CONDITIONAL_TOKENS)
+
+    # Check gas balance
+    pol_balance = w3.eth.get_balance(wallet_cs)
+    gas_price = w3.eth.gas_price
+    min_cost = 150000 * gas_price
+    if pol_balance < min_cost:
+        return False
+
+    # Gnosis Safe execTransaction ABI
+    SAFE_EXEC_ABI = json.loads('[{"inputs":[{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"},{"name":"operation","type":"uint8"},{"name":"safeTxGas","type":"uint256"},{"name":"baseGas","type":"uint256"},{"name":"gasPrice","type":"uint256"},{"name":"gasToken","type":"address"},{"name":"refundReceiver","type":"address"},{"name":"signatures","type":"bytes"}],"name":"execTransaction","outputs":[{"name":"success","type":"bool"}],"stateMutability":"payable","type":"function"}]')
+
+    safe = w3.eth.contract(address=funder_cs, abi=SAFE_EXEC_ABI)
+
+    # Owner signature: r=owner, s=0, v=1
+    owner_bytes = bytes.fromhex(WALLET_ADDRESS.replace("0x", "").lower().zfill(64))
+    signature = owner_bytes + b'\x00' * 32 + b'\x01'
+
+    nonce = w3.eth.get_transaction_count(wallet_cs)
+    tx = safe.functions.execTransaction(
+        ctf_cs, 0, bytes.fromhex(redeem_data[2:]), 0, 0, 0, 0,
+        "0x0000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000",
+        signature
+    ).build_transaction({
+        "from": wallet_cs, "nonce": nonce, "gas": 150000,
+        "gasPrice": int(gas_price * 1.5), "chainId": CHAIN_ID,
+    })
+
+    account = w3.eth.account.from_key(PRIVATE_KEY)
+    signed = account.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+    if receipt["status"] == 1:
+        log.info(f"REDEEM on-chain: {condition_id[:16]}... tx={tx_hash.hex()[:16]}")
+        return True
+    return False
+
+
+def redeem_position(condition_id: str) -> bool:
+    """
+    Redeem a resolved position. Tries relayer (gas-free) first, falls back to on-chain.
+    """
+    if not condition_id or not PRIVATE_KEY or not FUNDER_ADDRESS:
+        return False
+
+    try:
+        redeem_data = _encode_redeem_calldata(condition_id)
+
+        # Try 1: Relayer (gas-free, needs RELAYER_API_KEY)
+        if _redeem_via_relayer(condition_id, redeem_data):
             return True
 
-        # Fallback: use the Polymarket Neg Risk Adapter via direct HTTP
-        # The proxy wallet needs to call redeemPositions on the contract
-        # This requires web3 — add if needed
+        # Try 2: On-chain (needs POL for gas)
+        if _redeem_via_onchain(condition_id, redeem_data):
+            return True
+
         log.warning(
-            f"Redeem not available via CLOB client for {condition_id[:16]}... "
-            f"Manual redemption may be needed."
+            f"Cannot redeem {condition_id[:16]}... "
+            f"Need RELAYER_API_KEY env var (from polymarket.com/settings) "
+            f"or POL on wallet for gas"
         )
         return False
 
     except Exception as e:
         log.error(f"Redeem failed for {condition_id[:16]}...: {e}")
         return False
+
+
+def check_and_redeem_positions():
+    """
+    Check Data API for redeemable positions and redeem them via relayer (gas-free).
+    Returns total USDC redeemed.
+    """
+    if not FUNDER_ADDRESS:
+        return 0
+
+    try:
+        funder = FUNDER_ADDRESS.lower()
+        resp = requests.get(
+            f"{DATA_API}/positions",
+            params={"user": funder},
+            timeout=15
+        )
+        if resp.status_code != 200:
+            return 0
+
+        positions = resp.json()
+        redeemable = [p for p in positions if p.get("redeemable")]
+
+        if not redeemable:
+            return 0
+
+        # Only try if we have a way to redeem (relayer key or POL)
+        has_relayer = bool(os.getenv("RELAYER_API_KEY", ""))
+        has_pol = False
+        try:
+            w3 = get_web3()
+            if w3:
+                wallet_cs = Web3.to_checksum_address(WALLET_ADDRESS)
+                pol = w3.eth.get_balance(wallet_cs)
+                has_pol = pol > 150000 * w3.eth.gas_price
+        except Exception:
+            pass
+
+        if not has_relayer and not has_pol:
+            # Only log once per hour
+            total_payout = sum(float(p.get("payout", 0)) for p in redeemable)
+            if total_payout > 0:
+                log.warning(
+                    f"{len(redeemable)} redeemable positions (${total_payout:.2f} payout) "
+                    f"but no RELAYER_API_KEY and no POL for gas"
+                )
+            return 0
+
+        log.info(f"Found {len(redeemable)} redeemable positions")
+
+        total_redeemed = 0
+        redeemed_count = 0
+
+        for pos in redeemable:
+            condition_id = pos.get("conditionId", "")
+            payout = float(pos.get("payout", 0))
+            title = pos.get("title", "?")[:40]
+
+            if not condition_id:
+                continue
+
+            log.info(f"Redeeming: '{title}' payout=${payout:.2f}")
+
+            if redeem_position(condition_id):
+                total_redeemed += payout
+                redeemed_count += 1
+                time.sleep(3)  # Wait between redemptions for nonce update
+            else:
+                # If first attempt fails, no point trying the rest with same method
+                break
+
+        if redeemed_count > 0:
+            log.info(f"Redeemed {redeemed_count} positions, total payout: ${total_redeemed:.2f}")
+
+        return total_redeemed
+
+    except Exception as e:
+        log.error(f"Redeem check error: {e}")
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -741,12 +1119,24 @@ except ImportError:
 
 
 def get_divergence_threshold(signal: dict) -> float:
-    """Get the appropriate divergence threshold for a signal source."""
+    """Get the appropriate divergence threshold for a signal source.
+    Uses learned thresholds from research_loop if available."""
     source = signal.get("source", "")
     confidence = signal.get("confidence", 0)
 
+    # Check learned thresholds first
+    try:
+        if STRATEGY_FILE.exists():
+            with open(STRATEGY_FILE) as f:
+                params = json.load(f)
+            learned = params.get("source_thresholds", {})
+            if source in learned:
+                return learned[source]
+    except Exception:
+        pass
+
+    # Fallback to hardcoded defaults
     if source == "sportsbook":
-        # High confidence = 4+ bookmakers
         if confidence >= 0.7:
             return DIVERGENCE_THRESHOLDS["sportsbook_high"]
         else:
@@ -858,7 +1248,7 @@ def execute_trade(market: dict, signal: dict, bankroll: float) -> dict | None:
     neg_risk = market.get("negRisk", False)
     question = market.get("question", "")
 
-    tick_size = "0.001" if neg_risk else "0.01"
+    tick_size = get_tick_size(token_id, neg_risk)
     if tick_size == "0.001":
         price = round(price, 3)
     else:
@@ -866,10 +1256,11 @@ def execute_trade(market: dict, signal: dict, bankroll: float) -> dict | None:
 
     # Check existing position size BEFORE sizing new order
     # This prevents accidental over-allocation from repeated fills
+    # Check ALL statuses (not just open) to prevent rebuying resolved positions
     positions = load_json(POSITIONS_FILE)
     existing_cost = sum(
         p.get("cost", 0) for p in positions
-        if p.get("status") == "open" and p.get("token_id") == token_id
+        if p.get("token_id") == token_id
     )
     max_per_position = bankroll * MAX_POSITION_FRACTION
     remaining_budget = max(0, max_per_position - existing_cost)
@@ -880,7 +1271,21 @@ def execute_trade(market: dict, signal: dict, bankroll: float) -> dict | None:
             return None
         log.info(f"Existing position ${existing_cost:.2f} in '{question[:30]}', budget remaining: ${remaining_budget:.2f}")
 
-    dollar_size = position_size(bankroll, est_prob, price)
+    # Check subcategory block
+    source_name = signal.get("signal_source", "")
+    try:
+        if STRATEGY_FILE.exists():
+            with open(STRATEGY_FILE) as f:
+                sparams = json.load(f)
+            from research_loop import classify_subcategory
+            subcat = classify_subcategory(question, source_name)
+            if subcat in sparams.get("blocked_subcategories", []):
+                log.info(f"SKIP (blocked subcategory): '{question[:40]}' subcat={subcat}")
+                return None
+    except Exception:
+        pass
+
+    dollar_size = position_size(bankroll, est_prob, price, source=source_name)
     if dollar_size < 1.0:
         return None
 
@@ -967,6 +1372,9 @@ def update_position_from_trade(trade: dict):
             break
 
     if existing:
+        # If position was resolved/dead but we're buying back in, reopen it
+        if existing.get("status") not in ("open", "matched"):
+            existing["status"] = "open"
         old_shares = existing.get("shares", 0)
         old_cost = existing.get("cost", 0)
         new_shares = old_shares + trade["shares"]
@@ -1056,6 +1464,38 @@ def check_position_exits():
 
         # Only exit: deadweight positions losing >60% with no recovery prospect
         if pnl_pct < -STOP_LOSS_PCT:
+            # If value is $0 or near-zero, mark as resolved loss — nothing to sell
+            if current_value < 0.01:
+                log.info(
+                    f"DEAD POSITION: '{pos['market'][:40]}' "
+                    f"cost=${cost:.2f}, value=$0 — marking as resolved loss"
+                )
+                positions = load_json(POSITIONS_FILE)
+                for p in positions:
+                    if p.get("token_id") == pos.get("token_id") and p.get("status") == "open":
+                        p["status"] = "resolved_loss"
+                        p["profit"] = -cost
+                        p["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                save_json(POSITIONS_FILE, positions)
+
+                # Record in PnL
+                pnl = load_json(PNL_FILE)
+                pnl.append({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "market": pos.get("market", ""),
+                    "side": pos.get("side", ""),
+                    "cost": cost,
+                    "shares": pos.get("shares", 0),
+                    "won": False,
+                    "payout": 0,
+                    "profit": -cost,
+                    "exit_type": "dead_position",
+                    "signal_source": pos.get("signal_source", "unknown"),
+                })
+                save_json(PNL_FILE, pnl)
+                exits_done += 1
+                continue
+
             slug = pos.get("slug", "")
             if not slug:
                 continue
@@ -1104,7 +1544,7 @@ def sell_position(pos: dict, market: dict, pt: dict, current_price: float) -> bo
     else:
         token_id = pt["no_token"]
 
-    tick_size = "0.001" if neg_risk else "0.01"
+    tick_size = get_tick_size(token_id, neg_risk)
 
     # Price slightly below market for quick fill
     # SELL limit orders near market price get matched instantly on Polymarket
@@ -1171,7 +1611,18 @@ def sell_position(pos: dict, market: dict, pt: dict, current_price: float) -> bo
             return False
 
     except Exception as e:
+        err_str = str(e)
         log.error(f"Sell failed: {e}")
+        # If balance/allowance error, tokens are likely already redeemed/gone
+        if "not enough balance" in err_str or "allowance" in err_str:
+            log.info(f"Marking '{pos['market'][:40]}' as resolved (tokens gone from chain)")
+            positions = load_json(POSITIONS_FILE)
+            for p in positions:
+                if p.get("token_id") == token_id and p.get("status") == "open":
+                    p["status"] = "resolved_loss"
+                    p["profit"] = -pos.get("cost", 0)
+                    p["resolved_at"] = datetime.now(timezone.utc).isoformat()
+            save_json(POSITIONS_FILE, positions)
         return False
 
 
@@ -1510,8 +1961,9 @@ def scan_opportunities() -> list:
 
 def run_trading_cycle(state: dict):
     """One full cycle: scan, evaluate, trade."""
-    bankroll = get_balance()
-    log.info(f"Current bankroll: ${bankroll:.2f}")
+    cash, pos_val, total = get_portfolio_value()
+    bankroll = cash
+    log.info(f"Portfolio: ${total:.2f} (cash: ${cash:.2f}, positions: ${pos_val:.2f})")
 
     if bankroll < 1.0:
         log.warning("Bankroll too low to trade. Waiting for resolved positions...")
@@ -1688,7 +2140,7 @@ def write_report(state: dict):
 - **Primair:** Sports + sportsbook odds (>=2% divergentie)
 - **Secundair:** Crypto (model + Deribit), Commodities, Macro
 - **Tertiar:** Manifold/Metaculus vergelijking (>=5-8% divergentie)
-- **Risk:** Max {MAX_THEME_FRACTION*100:.0f}% per thema, stop loss -{STOP_LOSS_PCT*100:.0f}%, take profit +{TAKE_PROFIT_PCT*100:.0f}%
+- **Risk:** Max {MAX_THEME_FRACTION*100:.0f}% per thema, stop loss -{STOP_LOSS_PCT*100:.0f}%
 - **Sizing:** Half-Kelly, max {MAX_POSITION_FRACTION*100:.0f}% per trade, {CASH_RESERVE_FRACTION*100:.0f}% cash reserve
 """
 
@@ -1758,8 +2210,9 @@ def main():
     state = load_state()
 
     # Initial balance check
-    balance = get_balance()
-    log.info(f"Starting bankroll: ${balance:.2f}")
+    cash, pos_val, total = get_portfolio_value()
+    balance = cash
+    log.info(f"Portfolio: ${total:.2f} (cash: ${cash:.2f}, positions: ${pos_val:.2f})")
     log.info(f"Target: $1,000")
     log.info(f"Signals: {'Available' if SIGNALS_AVAILABLE else 'Not available'}")
     log.info(f"Scan interval: {SCAN_INTERVAL}s | Report interval: {REPORT_INTERVAL}s")
@@ -1802,6 +2255,16 @@ def main():
                     state["last_scan"] = now_str
                 except Exception as e:
                     log.error(f"Trading cycle error: {e}\n{traceback.format_exc()}")
+
+            # 2b. Redeem resolved positions (every 10 min)
+            if should_run(state, "last_redeem", REDEEM_INTERVAL):
+                try:
+                    redeemed = check_and_redeem_positions()
+                    state["last_redeem"] = now_str
+                    if redeemed > 0:
+                        log.info(f"Redeemed ${redeemed:.2f} — reinvesting next cycle")
+                except Exception as e:
+                    log.error(f"Redeem error: {e}")
 
             # 3. Research loop (every 2 hours) — Fase 5
             if should_run(state, "last_research", RESEARCH_INTERVAL):
