@@ -33,7 +33,7 @@ log = logging.getLogger("autobot.signals")
 # ---------------------------------------------------------------------------
 
 _cache: dict[str, tuple[float, object]] = {}
-CACHE_TTL = 300  # 5 minutes
+CACHE_TTL = 1800  # 30 minutes — Odds API has 500 credits/month, must conserve
 
 
 def _cache_get(key: str):
