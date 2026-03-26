@@ -207,3 +207,97 @@ Je staat op de rand van een totale reset naar startkapitaal. **Een paar verkeerd
 De volgende 48 uur zijn kritiek - monitor ETH als een havik en ben klaar om je posities te dumpen als de markt tegen je draait.
 
 **JE HEBT GEEN RUIMTE MEER VOOR FOUTEN!**
+
+---
+## Sessie 2026-03-26 00:32 UTC
+
+Laat me eerst de actuele crypto prijzen ophalen om je kritieke ETH posities te beoordelen.
+Nu ga ik kijken naar de actieve crypto markten om je posities beter te kunnen inschatten:
+Laat me specifiek naar Ethereum crypto markten zoeken:
+## TRADING COACH ANALYSE - CODE ROOD! 🆘💥
+
+**KRITIEKE SITUATIE:**
+Portfolio verder gedaald naar $167.94 - je bent nu **ONDER je startkapitaal van $180**! Dit is een catastrofe van -6.7%.
+
+**ACTUELE CRYPTO CRISIS:**
+- **ETH nu op $2,168.85** - slechts $168 boven je $2,000 break-even!
+- **Je grootste positie ($31.49) kan morgen VOLLEDIG verdampen**
+
+### ONMIDDELLIJKE CRISIS ANALYSE:
+
+## 1. **ETH DOOM SCENARIO** ⚰️
+- ETH >$2000 op 29 maart ($31.49) staat op -$14.73 verlies
+- ETH >$2000 op 27 maart ($4.17) staat op -$3.37 verlies  
+- **TOTALE ETH >$2000 exposure: $35.66**
+- Met ETH op $2,168.85 ben je **1 slechte dag** van totaal verlies!
+
+## 2. **DISCIPLINE VOLLEDIG WEGGEVALLEN** 🚨
+- Je negeert ALLE mijn survival mode adviezen
+- Je tradet nog steeds crypto via "unknown" bron ondanks blokkades
+- Position sizes zijn WAANZINNIG: $31.49 is 19% van je portfolio!
+- Je pakt nog steeds lage-divergentie bets (Lakers O/U posities met 26-28% div)
+
+## 3. **OVER/UNDER EDGE WORDT VERNIETIGD**
+- Unknown O/U: nog steeds 100% win rate maar GEEN nieuwe volume
+- Sportsbook O/U: gedaald naar 55% door slechte selectie
+- Je vernietigt je enige werkende strategie met lage-kwaliteit bets!
+
+## 4. **THEME CLUSTERING RAMP GAAT DOOR**
+- Miami Open: $17.85 verlies (10.6% van portfolio!)
+- Je negeert volledig mijn 8% theme limit advies
+
+### EMERGENCY PROTOCOL - LAATSTE WAARSCHUWING! ⚠️
+
+**JE BENT OP WEG NAAR TOTALE NEDERLAAG**
+
+**ONMIDDELLIJKE ACTIES:**
+
+1. **ETH EXIT VANDAAG:**
+   - Verkoop ALLE ETH >$2000 posities NU
+   - Accepteer de $18 verlies voordat het $35+ wordt
+   - ETH kan elk moment crashen richting $2000
+
+2. **STOP ALLE NIEUWE TRADES:**
+   - Geen nieuwe posities tot je weer boven $180 bent
+   - Focus alleen op damage control
+
+3. **LIQUIDEER SLECHTE POSITIES:**
+   - Spurs vs Grizzlies (-$15.76) is hopeloos → verkoop
+   - Thunder NBA Finals bet kan ook geliquideerd
+
+### NIEUWE STRATEGIE - OVERLEVINGSMODUS:
+
+Je parameters zijn te agressief. Je handelt alsof je een $500 account hebt terwijl je onder startkapitaal zit!
+
+**ALLEEN DEZE TRADES TOEGESTAAN:**
+- Over/Under markten >40% divergentie
+- MAX $5 per positie (3% van portfolio)
+- GEEN crypto, GEEN moneylines, GEEN clustered themes
+
+```json
+{
+    "source_kelly": {"sportsbook": 0.2, "unknown": 0.25},
+    "source_thresholds": {"sportsbook": 0.40, "unknown": 0.35},
+    "source_max_fraction": {"sportsbook": 0.03, "unknown": 0.03},
+    "blocked_sources": ["crypto_model"],
+    "blocked_subcategories": ["sportsbook:moneyline", "unknown:moneyline", "crypto_model:crypto_daily", "crypto_model:crypto_term", "unknown:crypto_daily", "sportsbook:crypto", "unknown:crypto_term"],
+    "position_sizing": {"max_fraction": 0.03, "kelly_multiplier": 0.15},
+    "max_theme_fraction": 0.05,
+    "stop_loss_pct": 0.08
+}
+```
+
+### BRUTALE WAARHEID:
+
+**Je bent op weg naar een volledige reset naar $180.**
+
+Je negeert systematisch alle coaching adviezen en handelt emotioneel. Dit is geen trading meer - dit is gokken.
+
+**LAATSTE KANS:**
+- Liquideer ETH posities NU
+- Stop met nieuwe trades
+- Reset je mindset
+
+**Als je dit negeert, zie ik je volgende week terug op $150-160.**
+
+Je staat letterlijk op de rand van het falen van je $1000 doel. **WAKE UP CALL - ACT NOW!**
